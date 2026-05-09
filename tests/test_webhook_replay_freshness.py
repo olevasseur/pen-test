@@ -129,6 +129,18 @@ class WebhookReplayFreshnessTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "endpoint_path"):
             validate_replay_fixture(fixture)
 
+    def test_fixture_validation_rejects_wrong_provider(self):
+        fixture = _valid_fixture()
+        fixture["provider"] = "other"
+        with self.assertRaisesRegex(ValueError, "provider must be quicknode"):
+            validate_replay_fixture(fixture)
+
+    def test_fixture_validation_rejects_wrong_surface(self):
+        fixture = _valid_fixture()
+        fixture["surface"] = "other"
+        with self.assertRaisesRegex(ValueError, "surface must be btc_streams"):
+            validate_replay_fixture(fixture)
+
     def test_fixture_validation_rejects_non_staging_target_environment(self):
         fixture = _valid_fixture(target_environment="production")
         with self.assertRaisesRegex(ValueError, "must be staging"):
@@ -149,8 +161,36 @@ class WebhookReplayFreshnessTests(unittest.TestCase):
     def test_fixture_validation_rejects_inline_signing_secret(self):
         fixture = _valid_fixture()
         fixture["signing"]["reference"] = "super-secret-inline-value"
-        with self.assertRaisesRegex(ValueError, "external env: reference"):
+        with self.assertRaisesRegex(ValueError, "inline sensitive material"):
             validate_replay_fixture(fixture)
+
+    def test_fixture_validation_rejects_invalid_env_signing_references(self):
+        invalid_references = (
+            "env:",
+            "env:foo",
+            "env:quicknode_secret",
+            "env:abc.def",
+            "env:abc-def",
+            "env:sk_live_123",
+            "env:eyJhbGciOi...",
+            "literal-secret",
+            "qn_secret_value",
+            "anything-not-env",
+        )
+        for reference in invalid_references:
+            with self.subTest(reference=reference):
+                fixture = _valid_fixture()
+                fixture["signing"]["reference"] = reference
+                with self.assertRaises(ValueError):
+                    validate_replay_fixture(fixture)
+
+    def test_fixture_validation_accepts_strict_env_signing_references(self):
+        for reference in ("env:QUICKNODE_WEBHOOK_SECRET", "env:STAGING_QN_BTC_SIGNING_SECRET"):
+            with self.subTest(reference=reference):
+                fixture = _valid_fixture()
+                fixture["signing"]["reference"] = reference
+                parsed = validate_replay_fixture(fixture)
+                self.assertEqual(parsed.signing.reference, reference)
 
     def test_dry_run_plan_includes_required_cases(self):
         module = WebhookReplayFreshnessModule()
