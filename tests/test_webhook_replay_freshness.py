@@ -11,6 +11,7 @@ from pentest_harness.modules.webhook_replay_freshness import (
     WebhookReplayFreshnessModule,
     classify_webhook_freshness,
     classify_live_results,
+    prepare_webhook_request,
     validate_replay_fixture,
 )
 
@@ -101,7 +102,7 @@ class WebhookReplayFreshnessTests(unittest.TestCase):
         metadata = WebhookReplayFreshnessModule.metadata
         self.assertEqual(metadata.id, "webhook-replay-freshness")
         self.assertFalse(metadata.production_allowed)
-        self.assertFalse(metadata.requires_credentials)
+        self.assertTrue(metadata.requires_credentials)
         self.assertTrue(metadata.exploit_capable)
 
     def test_synthetic_fixtures_do_not_contain_private_target_details(self):
@@ -225,6 +226,7 @@ class WebhookReplayFreshnessTests(unittest.TestCase):
                     authorization_ticket="TEST-123",
                     sender=fake_sender,
                     now=self.now,
+                    allowed_base_urls=_allowed_base_urls(),
                 )
                 self.assertTrue(result.evidence_path.exists())
         self.assertEqual([request.case_id for request in captured], ["fresh_control", "stale_timestamp", "replay_identical_request"])
@@ -249,6 +251,7 @@ class WebhookReplayFreshnessTests(unittest.TestCase):
                     authorization_ticket="TEST-123",
                     sender=fake_sender,
                     now=self.now,
+                    allowed_base_urls=_allowed_base_urls(),
                 )
         self.assertEqual(captured[0].headers, captured[2].headers)
         self.assertEqual(captured[0].body, captured[2].body)
@@ -274,6 +277,7 @@ class WebhookReplayFreshnessTests(unittest.TestCase):
                     authorization_ticket="TEST-123",
                     sender=fake_sender,
                     now=self.now,
+                    allowed_base_urls=_allowed_base_urls(),
                 )
         fresh, stale = captured[0], captured[1]
         self.assertGreater(fresh.timestamp - stale.timestamp, 300)
@@ -314,6 +318,62 @@ class WebhookReplayFreshnessTests(unittest.TestCase):
                         authorization_ticket="TEST-123",
                         sender=lambda _request: WebhookHttpResponse(status_code=200),
                         now=self.now,
+                        allowed_base_urls=_allowed_base_urls(),
+                    )
+
+    def test_direct_live_execution_rejects_blank_authorization_ticket(self):
+        with tempfile.TemporaryDirectory() as runtime_tmp, tempfile.TemporaryDirectory() as fixture_tmp, tempfile.TemporaryDirectory() as target_tmp:
+            fixture_path = Path(fixture_tmp) / "fixture.json"
+            fixture_path.write_text(json.dumps(_valid_live_fixture()), encoding="utf-8")
+            with _runtime_context(runtime_tmp), patch.dict("os.environ", {"QUICKNODE_STAGING_WEBHOOK_SECRET": "unit-test-signing-value"}):
+                for ticket in (None, "", "   "):
+                    with self.subTest(ticket=ticket):
+                        with self.assertRaisesRegex(ValueError, "authorization_ticket is required"):
+                            WebhookReplayFreshnessModule().execute_live_staging(
+                                project="cheddar",
+                                target_environment="staging",
+                                target_repo=target_tmp,
+                                fixture_file=str(fixture_path),
+                                authorization_ticket=ticket,
+                                sender=lambda _request: WebhookHttpResponse(status_code=200),
+                                now=self.now,
+                                allowed_base_urls=_allowed_base_urls(),
+                            )
+
+    def test_direct_live_execution_rejects_missing_allowed_base_urls(self):
+        with tempfile.TemporaryDirectory() as runtime_tmp, tempfile.TemporaryDirectory() as fixture_tmp, tempfile.TemporaryDirectory() as target_tmp:
+            fixture_path = Path(fixture_tmp) / "fixture.json"
+            fixture_path.write_text(json.dumps(_valid_live_fixture()), encoding="utf-8")
+            with _runtime_context(runtime_tmp), patch.dict("os.environ", {"QUICKNODE_STAGING_WEBHOOK_SECRET": "unit-test-signing-value"}):
+                for allowed in ((), ("", "   ")):
+                    with self.subTest(allowed=allowed):
+                        with self.assertRaisesRegex(ValueError, "allowed_base_urls"):
+                            WebhookReplayFreshnessModule().execute_live_staging(
+                                project="cheddar",
+                                target_environment="staging",
+                                target_repo=target_tmp,
+                                fixture_file=str(fixture_path),
+                                authorization_ticket="TEST-123",
+                                sender=lambda _request: WebhookHttpResponse(status_code=200),
+                                now=self.now,
+                                allowed_base_urls=allowed,
+                            )
+
+    def test_live_fixture_base_url_must_be_allowed(self):
+        with tempfile.TemporaryDirectory() as runtime_tmp, tempfile.TemporaryDirectory() as fixture_tmp, tempfile.TemporaryDirectory() as target_tmp:
+            fixture_path = Path(fixture_tmp) / "fixture.json"
+            fixture_path.write_text(json.dumps(_valid_live_fixture()), encoding="utf-8")
+            with _runtime_context(runtime_tmp), patch.dict("os.environ", {"QUICKNODE_STAGING_WEBHOOK_SECRET": "unit-test-signing-value"}):
+                with self.assertRaisesRegex(ValueError, "allowed staging URL"):
+                    WebhookReplayFreshnessModule().execute_live_staging(
+                        project="cheddar",
+                        target_environment="staging",
+                        target_repo=target_tmp,
+                        fixture_file=str(fixture_path),
+                        authorization_ticket="TEST-123",
+                        sender=lambda _request: WebhookHttpResponse(status_code=200),
+                        now=self.now,
+                        allowed_base_urls=("https://different-staging.example.test",),
                     )
 
     def test_fixture_file_inside_pen_test_repo_is_rejected(self):
@@ -330,6 +390,7 @@ class WebhookReplayFreshnessTests(unittest.TestCase):
                         authorization_ticket="TEST-123",
                         sender=lambda _request: WebhookHttpResponse(status_code=200),
                         now=self.now,
+                        allowed_base_urls=_allowed_base_urls(),
                     )
         finally:
             fixture_path.unlink(missing_ok=True)
@@ -347,7 +408,49 @@ class WebhookReplayFreshnessTests(unittest.TestCase):
                     authorization_ticket="TEST-123",
                     sender=lambda _request: WebhookHttpResponse(status_code=200),
                     now=self.now,
+                    allowed_base_urls=_allowed_base_urls(),
                 )
+
+    def test_fixture_symlink_into_pen_test_repo_is_rejected(self):
+        target_fixture = Path(__file__).parents[1] / "tmp-webhook-fixture-symlink-target.test.json"
+        target_fixture.write_text(json.dumps(_valid_live_fixture()), encoding="utf-8")
+        try:
+            with tempfile.TemporaryDirectory() as link_tmp, tempfile.TemporaryDirectory() as target_tmp:
+                link_path = Path(link_tmp) / "fixture-link.json"
+                link_path.symlink_to(target_fixture)
+                with patch.dict("os.environ", {"QUICKNODE_STAGING_WEBHOOK_SECRET": "unit-test-signing-value"}):
+                    with self.assertRaisesRegex(ValueError, "outside the pen-test repo"):
+                        WebhookReplayFreshnessModule().execute_live_staging(
+                            project="cheddar",
+                            target_environment="staging",
+                            target_repo=target_tmp,
+                            fixture_file=str(link_path),
+                            authorization_ticket="TEST-123",
+                            sender=lambda _request: WebhookHttpResponse(status_code=200),
+                            now=self.now,
+                            allowed_base_urls=_allowed_base_urls(),
+                        )
+        finally:
+            target_fixture.unlink(missing_ok=True)
+
+    def test_fixture_symlink_into_target_repo_is_rejected(self):
+        with tempfile.TemporaryDirectory() as link_tmp, tempfile.TemporaryDirectory() as target_tmp:
+            target_fixture = Path(target_tmp) / "fixture.json"
+            target_fixture.write_text(json.dumps(_valid_live_fixture()), encoding="utf-8")
+            link_path = Path(link_tmp) / "fixture-link.json"
+            link_path.symlink_to(target_fixture)
+            with patch.dict("os.environ", {"QUICKNODE_STAGING_WEBHOOK_SECRET": "unit-test-signing-value"}):
+                with self.assertRaisesRegex(ValueError, "outside the target repo"):
+                    WebhookReplayFreshnessModule().execute_live_staging(
+                        project="cheddar",
+                        target_environment="staging",
+                        target_repo=target_tmp,
+                        fixture_file=str(link_path),
+                        authorization_ticket="TEST-123",
+                        sender=lambda _request: WebhookHttpResponse(status_code=200),
+                        now=self.now,
+                        allowed_base_urls=_allowed_base_urls(),
+                    )
 
     def test_evidence_report_omits_secret_signature_and_payload_body(self):
         captured = []
@@ -368,11 +471,52 @@ class WebhookReplayFreshnessTests(unittest.TestCase):
                     authorization_ticket="TEST-123",
                     sender=fake_sender,
                     now=self.now,
+                    allowed_base_urls=_allowed_base_urls(),
                 )
             evidence = result.evidence_path.read_text(encoding="utf-8")
         self.assertNotIn("unit-test-signing-value", evidence)
         self.assertNotIn(captured[0].headers["x-qn-signature"], evidence)
         self.assertNotIn("tb1qsyntheticunmatchedaddress", evidence)
+
+    def test_sanitized_errors_redact_secret_like_exception_text(self):
+        def fake_sender(_prepared):
+            raise RuntimeError(
+                "secret=unit-test-signing-value token=abcdef1234567890abcdef1234567890 "
+                "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.payload.signature"
+            )
+
+        with tempfile.TemporaryDirectory() as runtime_tmp, tempfile.TemporaryDirectory() as fixture_tmp, tempfile.TemporaryDirectory() as target_tmp:
+            fixture_path = Path(fixture_tmp) / "fixture.json"
+            fixture_path.write_text(json.dumps(_valid_live_fixture()), encoding="utf-8")
+            with _runtime_context(runtime_tmp), patch.dict("os.environ", {"QUICKNODE_STAGING_WEBHOOK_SECRET": "unit-test-signing-value"}):
+                result = WebhookReplayFreshnessModule().execute_live_staging(
+                    project="cheddar",
+                    target_environment="staging",
+                    target_repo=target_tmp,
+                    fixture_file=str(fixture_path),
+                    authorization_ticket="TEST-123",
+                    sender=fake_sender,
+                    now=self.now,
+                    allowed_base_urls=_allowed_base_urls(),
+                )
+            evidence = result.evidence_path.read_text(encoding="utf-8")
+        self.assertNotIn("unit-test-signing-value", evidence)
+        self.assertNotIn("abcdef1234567890abcdef1234567890", evidence)
+        self.assertNotIn("eyJhbGci", evidence)
+        self.assertIn("[REDACTED", evidence)
+
+    def test_quicknode_signing_test_vector_uses_nonce_timestamp_json_body(self):
+        fixture = validate_replay_fixture(_valid_live_fixture())
+        prepared = prepare_webhook_request(
+            fixture=fixture,
+            secret="synthetic-signing-secret",
+            case_id="fresh_control",
+            timestamp_category="fresh",
+            timestamp=1700000000,
+            nonce="synthetic-nonce",
+        )
+        expected_signature = "69a67cd04e12ba5497070eeecc73a1a5ea4f500b4d111f883264d28d9a833022"
+        self.assertEqual(prepared.headers["x-qn-signature"], expected_signature)
 
 
 def _valid_fixture(target_environment: str = "staging") -> dict:
@@ -421,6 +565,10 @@ def _valid_live_fixture() -> dict:
         }
     ]
     return fixture
+
+
+def _allowed_base_urls() -> tuple[str, ...]:
+    return ("https://staging.example.test",)
 
 
 def _case(case_id: str, timestamp_category: str, status_code: int, classification: str):
