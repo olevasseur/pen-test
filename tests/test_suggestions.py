@@ -38,12 +38,28 @@ class SuggestionTests(unittest.TestCase):
                 _code, stdout, _stderr = _run_main(["suggest", "cheddar", "--target-repo", str(repo)])
         self.assertIn("Run webhook negative-auth coverage", stdout)
 
-    def test_suggest_recommends_replay_freshness_module(self):
+    def test_suggest_reports_replay_freshness_skeleton_pending(self):
         with tempfile.TemporaryDirectory() as repo_tmp, tempfile.TemporaryDirectory() as runtime_tmp:
             repo = _make_security_repo(repo_tmp)
             with _suggest_context(runtime_tmp):
                 _code, stdout, _stderr = _run_main(["suggest", "cheddar", "--target-repo", str(repo)])
-        self.assertIn("Add webhook replay/freshness module", stdout)
+        self.assertIn("Webhook replay/freshness target coverage pending", stdout)
+
+    def test_suggest_recommends_replay_freshness_module_when_registry_lacks_one(self):
+        with tempfile.TemporaryDirectory() as repo_tmp:
+            repo = _make_security_repo(repo_tmp)
+            security_map = load_security_map(repo)
+            context = SuggestionContext(
+                project="demo",
+                security_map=security_map,
+                ledger_entries=(),
+                latest_scan_state=None,
+                route_inventory_artifacts=(),
+                module_ids=("route-inventory",),
+                production_capable_module_count=1,
+            )
+            suggestions = suggest_next_actions(context)
+        self.assertIn("add-webhook-replay-freshness-module", {suggestion.id for suggestion in suggestions})
 
     def test_suggest_detects_checkout_flow_coverage_gap(self):
         with tempfile.TemporaryDirectory() as repo_tmp, tempfile.TemporaryDirectory() as runtime_tmp:
@@ -199,6 +215,7 @@ class SuggestionTests(unittest.TestCase):
                     {"module_id": "webhook-negative", "outcome": "passed"},
                     {"module_id": "checkout-exposure-summary", "outcome": "passed"},
                     {"module_id": "security-map-drift", "outcome": "passed", "security_map_drift_detected": False},
+                    {"module_id": "webhook-replay-freshness", "outcome": "passed", "evidence_level": "non_mutating_probe"},
                 ),
                 latest_scan_state=None,
                 route_inventory_artifacts=(),
