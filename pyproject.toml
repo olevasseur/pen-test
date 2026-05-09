@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pentest-harness"
+version = "0.1.0"
+description = "Safety-first reusable security evidence harness"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+pentest = "pentest_harness.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
