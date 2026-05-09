@@ -1,12 +1,16 @@
 from datetime import UTC, datetime, timedelta
+from contextlib import contextmanager
 import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from pentest_harness.modules.webhook_replay_freshness import (
+    WebhookHttpResponse,
     WebhookReplayFreshnessModule,
     classify_webhook_freshness,
+    classify_live_results,
     validate_replay_fixture,
 )
 
@@ -202,6 +206,174 @@ class WebhookReplayFreshnessTests(unittest.TestCase):
         self.assertTrue(plan.no_http_sent)
         self.assertFalse(plan.live_execution_enabled)
 
+    def test_live_staging_execution_with_fake_sender_executes_exactly_three_cases(self):
+        captured = []
+
+        def fake_sender(prepared):
+            captured.append(prepared)
+            return WebhookHttpResponse(status_code=401 if prepared.case_id == "stale_timestamp" else 200)
+
+        with tempfile.TemporaryDirectory() as runtime_tmp, tempfile.TemporaryDirectory() as fixture_tmp, tempfile.TemporaryDirectory() as target_tmp:
+            fixture_path = Path(fixture_tmp) / "fixture.json"
+            fixture_path.write_text(json.dumps(_valid_live_fixture()), encoding="utf-8")
+            with _runtime_context(runtime_tmp), patch.dict("os.environ", {"QUICKNODE_STAGING_WEBHOOK_SECRET": "unit-test-signing-value"}):
+                result = WebhookReplayFreshnessModule().execute_live_staging(
+                    project="cheddar",
+                    target_environment="staging",
+                    target_repo=target_tmp,
+                    fixture_file=str(fixture_path),
+                    authorization_ticket="TEST-123",
+                    sender=fake_sender,
+                    now=self.now,
+                )
+                self.assertTrue(result.evidence_path.exists())
+        self.assertEqual([request.case_id for request in captured], ["fresh_control", "stale_timestamp", "replay_identical_request"])
+        self.assertEqual([case.case_id for case in result.cases], ["fresh_control", "stale_timestamp", "replay_identical_request"])
+
+    def test_replay_reuses_identical_signed_request_material_from_fresh_control(self):
+        captured = []
+
+        def fake_sender(prepared):
+            captured.append(prepared)
+            return WebhookHttpResponse(status_code=200)
+
+        with tempfile.TemporaryDirectory() as runtime_tmp, tempfile.TemporaryDirectory() as fixture_tmp, tempfile.TemporaryDirectory() as target_tmp:
+            fixture_path = Path(fixture_tmp) / "fixture.json"
+            fixture_path.write_text(json.dumps(_valid_live_fixture()), encoding="utf-8")
+            with _runtime_context(runtime_tmp), patch.dict("os.environ", {"QUICKNODE_STAGING_WEBHOOK_SECRET": "unit-test-signing-value"}):
+                WebhookReplayFreshnessModule().execute_live_staging(
+                    project="cheddar",
+                    target_environment="staging",
+                    target_repo=target_tmp,
+                    fixture_file=str(fixture_path),
+                    authorization_ticket="TEST-123",
+                    sender=fake_sender,
+                    now=self.now,
+                )
+        self.assertEqual(captured[0].headers, captured[2].headers)
+        self.assertEqual(captured[0].body, captured[2].body)
+        self.assertEqual(captured[0].timestamp, captured[2].timestamp)
+        self.assertEqual(captured[0].nonce, captured[2].nonce)
+
+    def test_stale_timestamp_is_older_than_freshness_tolerance(self):
+        captured = []
+
+        def fake_sender(prepared):
+            captured.append(prepared)
+            return WebhookHttpResponse(status_code=401)
+
+        with tempfile.TemporaryDirectory() as runtime_tmp, tempfile.TemporaryDirectory() as fixture_tmp, tempfile.TemporaryDirectory() as target_tmp:
+            fixture_path = Path(fixture_tmp) / "fixture.json"
+            fixture_path.write_text(json.dumps(_valid_live_fixture()), encoding="utf-8")
+            with _runtime_context(runtime_tmp), patch.dict("os.environ", {"QUICKNODE_STAGING_WEBHOOK_SECRET": "unit-test-signing-value"}):
+                WebhookReplayFreshnessModule().execute_live_staging(
+                    project="cheddar",
+                    target_environment="staging",
+                    target_repo=target_tmp,
+                    fixture_file=str(fixture_path),
+                    authorization_ticket="TEST-123",
+                    sender=fake_sender,
+                    now=self.now,
+                )
+        fresh, stale = captured[0], captured[1]
+        self.assertGreater(fresh.timestamp - stale.timestamp, 300)
+
+    def test_live_result_flags_possible_stale_and_replay_acceptance(self):
+        cases = (
+            _case("fresh_control", "fresh", 200, "boundary_accepted"),
+            _case("stale_timestamp", "stale", 200, "boundary_accepted"),
+            _case("replay_identical_request", "replay", 200, "boundary_accepted"),
+        )
+        stale_possible, replay_possible, inconclusive = classify_live_results(cases)
+        self.assertTrue(stale_possible)
+        self.assertTrue(replay_possible)
+        self.assertFalse(inconclusive)
+
+    def test_fresh_rejected_makes_live_result_inconclusive(self):
+        cases = (
+            _case("fresh_control", "fresh", 401, "boundary_rejected"),
+            _case("stale_timestamp", "stale", 401, "boundary_rejected"),
+            _case("replay_identical_request", "replay", 401, "boundary_rejected"),
+        )
+        stale_possible, replay_possible, inconclusive = classify_live_results(cases)
+        self.assertFalse(stale_possible)
+        self.assertFalse(replay_possible)
+        self.assertTrue(inconclusive)
+
+    def test_missing_env_var_for_signing_reference_fails_closed(self):
+        with tempfile.TemporaryDirectory() as runtime_tmp, tempfile.TemporaryDirectory() as fixture_tmp, tempfile.TemporaryDirectory() as target_tmp:
+            fixture_path = Path(fixture_tmp) / "fixture.json"
+            fixture_path.write_text(json.dumps(_valid_live_fixture()), encoding="utf-8")
+            with _runtime_context(runtime_tmp), patch.dict("os.environ", {}, clear=True):
+                with self.assertRaisesRegex(ValueError, "environment variable is not set"):
+                    WebhookReplayFreshnessModule().execute_live_staging(
+                        project="cheddar",
+                        target_environment="staging",
+                        target_repo=target_tmp,
+                        fixture_file=str(fixture_path),
+                        authorization_ticket="TEST-123",
+                        sender=lambda _request: WebhookHttpResponse(status_code=200),
+                        now=self.now,
+                    )
+
+    def test_fixture_file_inside_pen_test_repo_is_rejected(self):
+        fixture_path = Path(__file__).parents[1] / "tmp-webhook-fixture.test.json"
+        fixture_path.write_text(json.dumps(_valid_live_fixture()), encoding="utf-8")
+        try:
+            with tempfile.TemporaryDirectory() as target_tmp, patch.dict("os.environ", {"QUICKNODE_STAGING_WEBHOOK_SECRET": "unit-test-signing-value"}):
+                with self.assertRaisesRegex(ValueError, "outside the pen-test repo"):
+                    WebhookReplayFreshnessModule().execute_live_staging(
+                        project="cheddar",
+                        target_environment="staging",
+                        target_repo=target_tmp,
+                        fixture_file=str(fixture_path),
+                        authorization_ticket="TEST-123",
+                        sender=lambda _request: WebhookHttpResponse(status_code=200),
+                        now=self.now,
+                    )
+        finally:
+            fixture_path.unlink(missing_ok=True)
+
+    def test_fixture_file_inside_target_repo_is_rejected(self):
+        with tempfile.TemporaryDirectory() as target_tmp, patch.dict("os.environ", {"QUICKNODE_STAGING_WEBHOOK_SECRET": "unit-test-signing-value"}):
+            fixture_path = Path(target_tmp) / "fixture.json"
+            fixture_path.write_text(json.dumps(_valid_live_fixture()), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "outside the target repo"):
+                WebhookReplayFreshnessModule().execute_live_staging(
+                    project="cheddar",
+                    target_environment="staging",
+                    target_repo=target_tmp,
+                    fixture_file=str(fixture_path),
+                    authorization_ticket="TEST-123",
+                    sender=lambda _request: WebhookHttpResponse(status_code=200),
+                    now=self.now,
+                )
+
+    def test_evidence_report_omits_secret_signature_and_payload_body(self):
+        captured = []
+
+        def fake_sender(prepared):
+            captured.append(prepared)
+            return WebhookHttpResponse(status_code=200)
+
+        with tempfile.TemporaryDirectory() as runtime_tmp, tempfile.TemporaryDirectory() as fixture_tmp, tempfile.TemporaryDirectory() as target_tmp:
+            fixture_path = Path(fixture_tmp) / "fixture.json"
+            fixture_path.write_text(json.dumps(_valid_live_fixture()), encoding="utf-8")
+            with _runtime_context(runtime_tmp), patch.dict("os.environ", {"QUICKNODE_STAGING_WEBHOOK_SECRET": "unit-test-signing-value"}):
+                result = WebhookReplayFreshnessModule().execute_live_staging(
+                    project="cheddar",
+                    target_environment="staging",
+                    target_repo=target_tmp,
+                    fixture_file=str(fixture_path),
+                    authorization_ticket="TEST-123",
+                    sender=fake_sender,
+                    now=self.now,
+                )
+            evidence = result.evidence_path.read_text(encoding="utf-8")
+        self.assertNotIn("unit-test-signing-value", evidence)
+        self.assertNotIn(captured[0].headers["x-qn-signature"], evidence)
+        self.assertNotIn("tb1qsyntheticunmatchedaddress", evidence)
+
 
 def _valid_fixture(target_environment: str = "staging") -> dict:
     return {
@@ -230,6 +402,45 @@ def _valid_fixture(target_environment: str = "staging") -> dict:
             "description": "synthetic BTC-shaped event with unmatched output address",
         },
     }
+
+
+def _valid_live_fixture() -> dict:
+    fixture = _valid_fixture()
+    fixture["base_url"] = "https://staging.example.test"
+    fixture["signing"]["algorithm"] = "quicknode_hmac_sha256_hex_v1"
+    fixture["signing"]["signed_content_template"] = "nonce_timestamp_json_body"
+    fixture["payload_template"]["body"] = [
+        {
+            "txid": "synthetic-unmatched-btc-tx",
+            "vout": [
+                {
+                    "address": "tb1qsyntheticunmatchedaddress",
+                    "value": 1,
+                }
+            ],
+        }
+    ]
+    return fixture
+
+
+def _case(case_id: str, timestamp_category: str, status_code: int, classification: str):
+    from pentest_harness.modules.webhook_replay_freshness import LiveCaseResult
+
+    return LiveCaseResult(
+        case_id=case_id,
+        timestamp_category=timestamp_category,
+        status_code=status_code,
+        response_classification=classification,
+        http_sent=True,
+    )
+
+
+@contextmanager
+def _runtime_context(runtime_tmp: str):
+    from pentest_harness.core import artifacts
+
+    with patch.object(artifacts, "RUNTIME_ROOT", Path(runtime_tmp)):
+        yield
 
 
 if __name__ == "__main__":
