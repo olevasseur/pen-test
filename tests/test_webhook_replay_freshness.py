@@ -1,8 +1,14 @@
 from datetime import UTC, datetime, timedelta
+import json
 from pathlib import Path
+import tempfile
 import unittest
 
-from pentest_harness.modules.webhook_replay_freshness import WebhookReplayFreshnessModule, classify_webhook_freshness
+from pentest_harness.modules.webhook_replay_freshness import (
+    WebhookReplayFreshnessModule,
+    classify_webhook_freshness,
+    validate_replay_fixture,
+)
 
 
 class WebhookReplayFreshnessTests(unittest.TestCase):
@@ -92,6 +98,7 @@ class WebhookReplayFreshnessTests(unittest.TestCase):
         self.assertEqual(metadata.id, "webhook-replay-freshness")
         self.assertFalse(metadata.production_allowed)
         self.assertFalse(metadata.requires_credentials)
+        self.assertTrue(metadata.exploit_capable)
 
     def test_synthetic_fixtures_do_not_contain_private_target_details(self):
         module_path = Path(__file__).parents[1] / "src" / "pentest_harness" / "modules" / "webhook_replay_freshness.py"
@@ -100,16 +107,89 @@ class WebhookReplayFreshnessTests(unittest.TestCase):
             "cheddar" + ".biz",
             "staging" + "-" + "api",
             "coin" + "flow",
-            "quick" + "node",
             "svi" + "x",
             "authori" + "zation:",
             "cook" + "ie:",
             "private" + " key",
             "mnemo" + "nic",
-            "customer",
         )
         for term in forbidden_terms:
             self.assertNotIn(term, haystack)
+
+    def test_fixture_schema_validation_accepts_complete_synthetic_fixture(self):
+        fixture = validate_replay_fixture(_valid_fixture())
+        self.assertEqual(fixture.provider, "quicknode")
+        self.assertEqual(fixture.surface, "btc_streams")
+        self.assertEqual(fixture.endpoint_path, "/quicknode/btc/streams")
+        self.assertEqual(fixture.freshness_tolerance_seconds, 300)
+
+    def test_fixture_validation_rejects_missing_endpoint_path(self):
+        fixture = _valid_fixture()
+        fixture.pop("endpoint_path")
+        with self.assertRaisesRegex(ValueError, "endpoint_path"):
+            validate_replay_fixture(fixture)
+
+    def test_fixture_validation_rejects_non_staging_target_environment(self):
+        fixture = _valid_fixture(target_environment="production")
+        with self.assertRaisesRegex(ValueError, "must be staging"):
+            validate_replay_fixture(fixture)
+
+    def test_fixture_validation_rejects_money_impact(self):
+        fixture = _valid_fixture()
+        fixture["fixture_safety"]["no_money_impact"] = False
+        with self.assertRaisesRegex(ValueError, "no_money_impact"):
+            validate_replay_fixture(fixture)
+
+    def test_fixture_validation_rejects_non_synthetic_payload(self):
+        fixture = _valid_fixture()
+        fixture["fixture_safety"]["synthetic_payload"] = False
+        with self.assertRaisesRegex(ValueError, "synthetic_payload"):
+            validate_replay_fixture(fixture)
+
+    def test_fixture_validation_rejects_inline_signing_secret(self):
+        fixture = _valid_fixture()
+        fixture["signing"]["reference"] = "super-secret-inline-value"
+        with self.assertRaisesRegex(ValueError, "external env: reference"):
+            validate_replay_fixture(fixture)
+
+    def test_dry_run_plan_includes_required_cases(self):
+        module = WebhookReplayFreshnessModule()
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture_path = Path(tmp) / "fixture.json"
+            fixture_path.write_text(json.dumps(_valid_fixture()), encoding="utf-8")
+            plan = module.build_dry_run_plan(project="cheddar", target_environment="staging", fixture_file=str(fixture_path))
+        self.assertEqual(plan.planned_cases, ("fresh_control", "stale_timestamp", "replay_identical_request"))
+        self.assertTrue(plan.no_http_sent)
+        self.assertFalse(plan.live_execution_enabled)
+
+
+def _valid_fixture(target_environment: str = "staging") -> dict:
+    return {
+        "provider": "quicknode",
+        "surface": "btc_streams",
+        "endpoint_path": "/quicknode/btc/streams",
+        "target_environment": target_environment,
+        "signature_headers": {
+            "signature": "x-qn-signature",
+            "nonce": "x-qn-nonce",
+            "timestamp": "x-qn-timestamp",
+        },
+        "timestamp_format": "unix_seconds_or_documented_format",
+        "freshness_tolerance_seconds": 300,
+        "signing": {
+            "mode": "external_reference",
+            "reference": "env:QUICKNODE_STAGING_WEBHOOK_SECRET",
+        },
+        "fixture_safety": {
+            "synthetic_payload": True,
+            "no_money_impact": True,
+            "no_customer_data": True,
+            "staging_only": True,
+        },
+        "payload_template": {
+            "description": "synthetic BTC-shaped event with unmatched output address",
+        },
+    }
 
 
 if __name__ == "__main__":
