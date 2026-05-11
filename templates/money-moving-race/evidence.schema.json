@@ -1,0 +1,95 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Money Moving Race Campaign Result",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "campaign_id",
+    "project",
+    "target_name",
+    "classification",
+    "live_http_sent",
+    "staging_hit",
+    "production_hit",
+    "live_provider_calls",
+    "real_funds_used",
+    "local_proof_confirmed",
+    "external_reachability",
+    "deployment_topology_reachability",
+    "duplicate_queue_jobs_observed",
+    "duplicate_external_side_effect_observed",
+    "duplicate_durable_records_observed",
+    "staging_safety_controls_confirmed",
+    "staging_probe_run",
+    "decision_gate",
+    "caveats"
+  ],
+  "properties": {
+    "campaign_id": {
+      "type": "string"
+    },
+    "project": {
+      "type": "string"
+    },
+    "target_name": {
+      "type": "string"
+    },
+    "classification": {
+      "enum": ["critical", "high", "medium", "low", "inconclusive"]
+    },
+    "live_http_sent": {
+      "type": "boolean"
+    },
+    "staging_hit": {
+      "type": "boolean"
+    },
+    "production_hit": {
+      "type": "boolean"
+    },
+    "live_provider_calls": {
+      "type": "boolean"
+    },
+    "real_funds_used": {
+      "type": "boolean"
+    },
+    "local_proof_confirmed": {
+      "type": "boolean"
+    },
+    "external_reachability": {
+      "enum": ["yes", "no", "inconclusive"]
+    },
+    "deployment_topology_reachability": {
+      "enum": ["unknown", "supports_race", "serializes_race", "inconclusive"]
+    },
+    "duplicate_queue_jobs_observed": {
+      "enum": ["yes", "no", "inconclusive"]
+    },
+    "duplicate_external_side_effect_observed": {
+      "enum": ["yes", "no", "inconclusive"]
+    },
+    "duplicate_durable_records_observed": {
+      "enum": ["yes", "no", "inconclusive"]
+    },
+    "staging_safety_controls_confirmed": {
+      "type": "boolean"
+    },
+    "staging_probe_run": {
+      "type": "boolean"
+    },
+    "decision_gate": {
+      "enum": [
+        "unset",
+        "continue_deep_exploit_proof",
+        "stop_and_write_latent_finding",
+        "do_staging_readiness_first",
+        "needs_explicit_approval"
+      ]
+    },
+    "caveats": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  }
+}
